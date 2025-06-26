@@ -232,4 +232,6 @@ If you encounter any issues or have questions:
 2. Review the code comments for guidance
 3. Open an issue on GitHub
 
+---
+
 **Built with ❤️ using modern web technologies**
