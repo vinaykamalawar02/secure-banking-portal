@@ -1,0 +1,48 @@
+# Database files (contains sensitive data)
+database.sqlite
+*.sqlite
+*.sqlite3
+
+# System files
+.DS_Store
+Thumbs.db
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Temporary files
+*.tmp
+*.temp
+*.cache
+
+# Environment files
+.env
+.env.local
+.env.production
+
+# Backup files
+*.bak
+*_backup.php
+index_backup.php
+
+# Test files
+test_account_creation.php
+
+# OS generated files
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+
+# PHP session files
+sessions/
+*.sess
+
+# Error logs
+error_log
+php_errors.log 
