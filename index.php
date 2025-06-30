@@ -1,72 +1,118 @@
 <?php
 require_once 'includes/config.php';
+require_once 'includes/security.php';
+
+// Initialize secure session
+init_secure_session();
 
 $error = '';
 $success = '';
-$active_tab = $_GET['tab'] ?? 'customer'; // Default to customer tab
+$active_tab = $_GET['tab'] ?? 'user'; // Default to user tab
 
 // Handle login form submission
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $username = trim($_POST['username'] ?? '');
-    $password = $_POST['password'] ?? '';
-    $login_type = $_POST['login_type'] ?? 'customer';
-    
-    if (empty($username) || empty($password)) {
-        $error = 'Please enter both username and password.';
+    // Verify CSRF token
+    if (!verify_csrf_token($_POST['csrf_token'] ?? '')) {
+        $error = 'Invalid request. Please try again.';
     } else {
-        $redirect_url = '';
+        $username = trim($_POST['username'] ?? '');
+        $password = $_POST['password'] ?? '';
+        $login_type = $_POST['login_type'] ?? 'user';
         
-        switch ($login_type) {
-            case 'admin':
-                // Check admin login
-                $stmt = $conn->prepare("SELECT id, name, username, password, status FROM admin WHERE username = ? AND status = 'active'");
-                $stmt->execute([$username]);
-                $admin = $stmt->fetch();
+        // Validate login type
+        if (!in_array($login_type, ['admin', 'manager', 'user'])) {
+            $error = 'Invalid login type.';
+        } elseif (empty($username) || empty($password)) {
+            $error = 'Please enter both username and password.';
+        } else {
+            // Check for account lockout
+            if (!check_login_attempts($username, $login_type)) {
+                $error = 'Account is temporarily locked due to multiple failed login attempts. Please try again later.';
+            } else {
+                $redirect_url = '';
+                $user_data = null;
                 
-                if ($admin && password_verify($password, $admin['password'])) {
-                    login_user($admin['id'], $admin['username'], 'admin');
-                    log_activity($admin['id'], 'admin', 'Login successful');
-                    $redirect_url = 'admin/index.php';
-                } else {
-                    $error = 'Invalid admin credentials.';
+                try {
+                    switch ($login_type) {
+                        case 'admin':
+                            // Check admin login
+                            $stmt = $conn->prepare("SELECT id, name, username, password, email, status, two_factor_enabled FROM admin WHERE username = ? AND status = 'active'");
+                            $stmt->execute([$username]);
+                            $user_data = $stmt->fetch();
+                            break;
+                            
+                        case 'manager':
+                            // Check manager login
+                            $stmt = $conn->prepare("SELECT id, name, username, password, email, status, two_factor_enabled FROM managers WHERE username = ? AND status = 'active'");
+                            $stmt->execute([$username]);
+                            $user_data = $stmt->fetch();
+                            break;
+                            
+                        case 'user':
+                        default:
+                            // Check user login
+                            $stmt = $conn->prepare("SELECT id, name, username, password, email, status, two_factor_enabled FROM users WHERE username = ? AND status = 'active'");
+                            $stmt->execute([$username]);
+                            $user_data = $stmt->fetch();
+                            break;
+                    }
+                    
+                    if ($user_data && password_verify($password, $user_data['password'])) {
+                        // Clear failed login attempts
+                        clear_login_attempts($username, $login_type);
+                        
+                        // Check if 2FA is enabled (with null check)
+                        if (!empty($user_data['two_factor_enabled'])) {
+                            // Generate and send OTP
+                            $otp = generate_otp();
+                            if (store_otp($user_data['id'], $login_type, $otp)) {
+                                if (send_otp_email($user_data['email'], $otp, $user_data['username'])) {
+                                    // Start 2FA process
+                                    secure_login($user_data['id'], $user_data['username'], $login_type, true);
+                                    header('Location: verify_2fa.php');
+                                    exit();
+                                } else {
+                                    $error = 'Failed to send verification code. Please try again.';
+                                    log_security_event($user_data['id'], $login_type, '2FA email send failed');
+                                }
+                            } else {
+                                $error = 'Failed to generate verification code. Please try again.';
+                            }
+                        } else {
+                            // Direct login without 2FA
+                            secure_login($user_data['id'], $user_data['username'], $login_type, false);
+                            
+                            // Log successful login
+                            log_security_event($user_data['id'], $login_type, 'Login successful');
+                            
+                            // Redirect to appropriate dashboard
+                            switch ($login_type) {
+                                case 'admin':
+                                    $redirect_url = 'admin/index.php';
+                                    break;
+                                case 'manager':
+                                    $redirect_url = 'manager/index.php';
+                                    break;
+                                case 'user':
+                                default:
+                                    $redirect_url = 'user/index.php';
+                                    break;
+                            }
+                            
+                            header('Location: ' . $redirect_url);
+                            exit();
+                        }
+                    } else {
+                        // Record failed login attempt
+                        record_login_attempt($username, $login_type, $_SERVER['REMOTE_ADDR'] ?? 'unknown');
+                        $error = 'Invalid credentials. Please try again.';
+                        log_security_event(0, $login_type, 'Failed login attempt', "Username: $username");
+                    }
+                } catch (PDOException $e) {
+                    $error = 'Database error occurred. Please try again.';
+                    log_security_event(0, $login_type, 'Database error during login', $e->getMessage());
                 }
-                break;
-                
-            case 'manager':
-                // Check manager login
-                $stmt = $conn->prepare("SELECT id, name, username, password, status FROM managers WHERE username = ? AND status = 'active'");
-                $stmt->execute([$username]);
-                $manager = $stmt->fetch();
-                
-                if ($manager && password_verify($password, $manager['password'])) {
-                    login_user($manager['id'], $manager['username'], 'manager');
-                    log_activity($manager['id'], 'manager', 'Login successful');
-                    $redirect_url = 'manager/index.php';
-                } else {
-                    $error = 'Invalid manager credentials.';
-                }
-                break;
-                
-            case 'customer':
-            default:
-                // Check user login
-                $stmt = $conn->prepare("SELECT id, name, username, password, status FROM users WHERE username = ? AND status = 'active'");
-                $stmt->execute([$username]);
-                $user = $stmt->fetch();
-                
-                if ($user && password_verify($password, $user['password'])) {
-                    login_user($user['id'], $user['username'], 'user');
-                    log_activity($user['id'], 'user', 'Login successful');
-                    $redirect_url = 'user/index.php';
-                } else {
-                    $error = 'Invalid customer credentials.';
-                }
-                break;
-        }
-        
-        if ($redirect_url) {
-            header('Location: ' . $redirect_url);
-            exit();
+            }
         }
     }
 }
@@ -84,6 +130,11 @@ if (is_logged_in()) {
             header('Location: user/index.php');
             exit();
     }
+}
+
+// Display session expired message
+if (isset($_GET['error']) && $_GET['error'] === 'session_expired') {
+    $error = 'Your session has expired. Please log in again.';
 }
 ?>
 
@@ -121,12 +172,16 @@ if (is_logged_in()) {
       </div>
       <h1>Secure Banking Portal</h1>
       <p>Choose your access level and enter your credentials</p>
+      <div class="security-badge">
+        <i class="fas fa-shield-alt"></i>
+        <span>Enhanced Security with 2FA</span>
+      </div>
     </div>
 
     <!-- Tab Navigation -->
     <div class="tab-container">
-      <button onclick="switchTab('customer')" id="tab-customer" class="tab-button <?= $active_tab === 'customer' ? 'active' : '' ?>">
-        <i class="fas fa-user"></i>Customer
+      <button onclick="switchTab('user')" id="tab-user" class="tab-button <?= $active_tab === 'user' ? 'active' : '' ?>">
+        <i class="fas fa-user"></i>User
       </button>
       <button onclick="switchTab('manager')" id="tab-manager" class="tab-button <?= $active_tab === 'manager' ? 'active' : '' ?>">
         <i class="fas fa-user-tie"></i>Manager
@@ -136,32 +191,32 @@ if (is_logged_in()) {
       </button>
     </div>
 
-    <!-- Customer Login Form -->
-    <form method="POST" id="form-customer" class="login-form <?= $active_tab === 'customer' ? 'active' : '' ?>">
-      <input type="hidden" name="login_type" value="customer">
+    <!-- User Login Form -->
+    <form method="POST" id="form-user" class="login-form <?= $active_tab === 'user' ? 'active' : '' ?>">
+      <input type="hidden" name="login_type" value="user">
       <input type="hidden" name="csrf_token" value="<?= generate_csrf_token() ?>">
       
       <div class="form-group">
-        <label for="customer-username" class="form-label">Username</label>
+        <label for="user-username" class="form-label">Username</label>
         <div class="input-group">
           <i class="fas fa-user input-icon"></i>
-          <input type="text" name="username" id="customer-username" required placeholder="Enter your username" class="form-input" />
+          <input type="text" name="username" id="user-username" required placeholder="Enter your username" class="form-input" maxlength="50" />
         </div>
       </div>
 
       <div class="form-group">
-        <label for="customer-password" class="form-label">Password</label>
+        <label for="user-password" class="form-label">Password</label>
         <div class="input-group">
           <i class="fas fa-lock input-icon"></i>
-          <input type="password" name="password" id="customer-password" required placeholder="Enter your password" class="form-input" />
-          <button type="button" onclick="togglePassword('customer-password')" class="password-toggle">
-            <i class="fas fa-eye" id="customer-eye-icon"></i>
+          <input type="password" name="password" id="user-password" required placeholder="Enter your password" class="form-input" maxlength="255" />
+          <button type="button" onclick="togglePassword('user-password')" class="password-toggle">
+            <i class="fas fa-eye" id="user-eye-icon"></i>
           </button>
         </div>
       </div>
 
-      <button type="submit" class="submit-button customer">
-        <i class="fas fa-sign-in-alt"></i> Access Customer Portal
+      <button type="submit" class="submit-button user">
+        <i class="fas fa-sign-in-alt"></i> Access User Portal
       </button>
     </form>
 
@@ -174,7 +229,7 @@ if (is_logged_in()) {
         <label for="manager-username" class="form-label">Manager Username</label>
         <div class="input-group">
           <i class="fas fa-user-tie input-icon"></i>
-          <input type="text" name="username" id="manager-username" required placeholder="Enter manager username" class="form-input" />
+          <input type="text" name="username" id="manager-username" required placeholder="Enter manager username" class="form-input" maxlength="50" />
         </div>
       </div>
 
@@ -182,7 +237,7 @@ if (is_logged_in()) {
         <label for="manager-password" class="form-label">Manager Password</label>
         <div class="input-group">
           <i class="fas fa-lock input-icon"></i>
-          <input type="password" name="password" id="manager-password" required placeholder="Enter manager password" class="form-input" />
+          <input type="password" name="password" id="manager-password" required placeholder="Enter manager password" class="form-input" maxlength="255" />
           <button type="button" onclick="togglePassword('manager-password')" class="password-toggle">
             <i class="fas fa-eye" id="manager-eye-icon"></i>
           </button>
@@ -203,7 +258,7 @@ if (is_logged_in()) {
         <label for="admin-username" class="form-label">Admin Username</label>
         <div class="input-group">
           <i class="fas fa-shield-alt input-icon"></i>
-          <input type="text" name="username" id="admin-username" required placeholder="Enter admin username" class="form-input" />
+          <input type="text" name="username" id="admin-username" required placeholder="Enter admin username" class="form-input" maxlength="50" />
         </div>
       </div>
 
@@ -211,7 +266,7 @@ if (is_logged_in()) {
         <label for="admin-password" class="form-label">Admin Password</label>
         <div class="input-group">
           <i class="fas fa-lock input-icon"></i>
-          <input type="password" name="password" id="admin-password" required placeholder="Enter admin password" class="form-input" />
+          <input type="password" name="password" id="admin-password" required placeholder="Enter admin password" class="form-input" maxlength="255" />
           <button type="button" onclick="togglePassword('admin-password')" class="password-toggle">
             <i class="fas fa-eye" id="admin-eye-icon"></i>
           </button>
@@ -222,60 +277,17 @@ if (is_logged_in()) {
         <i class="fas fa-shield-alt"></i> Access Admin Portal
       </button>
     </form>
-
-    <!-- Footer Links -->
-    <div class="login-footer">
-      <a href="user/register.php" class="create-account-btn">
-        <i class="fas fa-user-plus"></i> Create New Account
-      </a>
-      <a href="#" class="contact-link" onclick="showModal('contact-modal')">
-        <i class="fas fa-headset"></i>Contact Support
-      </a>
-    </div>
-  </div>
-
-  <!-- Contact Form Modal -->
-  <div id="contact-modal" class="modal">
-    <div class="modal-content">
-      <button onclick="hideModal('contact-modal')" class="modal-close">
-        <i class="fas fa-times"></i>
-      </button>
-      <div class="modal-header">
-        <div class="icon">
-          <i class="fas fa-headset"></i>
-        </div>
-        <h2>Contact Support</h2>
-        <p>We're here to help you</p>
-      </div>
-      <form class="space-y-4">
-        <div class="form-group">
-          <label class="form-label">Your Name</label>
-          <input type="text" class="form-input" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Email</label>
-          <input type="email" class="form-input" required>
-        </div>
-        <div class="form-group">
-          <label class="form-label">Message</label>
-          <textarea class="form-input" rows="3" required></textarea>
-        </div>
-        <button type="submit" class="submit-button customer">
-          <i class="fas fa-paper-plane"></i>Send Message
-        </button>
-      </form>
-    </div>
   </div>
 
   <script>
     function switchTab(tab) {
       // Hide all forms
-      document.getElementById('form-customer').classList.remove('active');
+      document.getElementById('form-user').classList.remove('active');
       document.getElementById('form-manager').classList.remove('active');
       document.getElementById('form-admin').classList.remove('active');
       
       // Remove active class from all tabs
-      document.getElementById('tab-customer').classList.remove('active');
+      document.getElementById('tab-user').classList.remove('active');
       document.getElementById('tab-manager').classList.remove('active');
       document.getElementById('tab-admin').classList.remove('active');
       
@@ -293,31 +305,51 @@ if (is_logged_in()) {
       const input = document.getElementById(inputId);
       const icon = document.getElementById(inputId.replace('-password', '-eye-icon'));
       
-      if (input.type === 'password') {
-        input.type = 'text';
-        icon.classList.remove('fa-eye');
-        icon.classList.add('fa-eye-slash');
-      } else {
-        input.type = 'password';
-        icon.classList.remove('fa-eye-slash');
-        icon.classList.add('fa-eye');
+      if (input && icon) {
+        if (input.type === 'password') {
+          input.type = 'text';
+          icon.classList.remove('fa-eye');
+          icon.classList.add('fa-eye-slash');
+        } else {
+          input.type = 'password';
+          icon.classList.remove('fa-eye-slash');
+          icon.classList.add('fa-eye');
+        }
       }
     }
 
     // Set initial tab based on URL parameter
     const urlParams = new URLSearchParams(window.location.search);
     const tab = urlParams.get('tab');
-    if (tab) {
+    if (tab && ['user', 'manager', 'admin'].includes(tab)) {
       switchTab(tab);
     }
 
-    // Show error popup if there's an error
-    <?php if (!empty($error)): ?>
-    window.onload = () => {
-      showErrorPopup(<?= json_encode($error) ?>);
-    };
-    <?php endif; ?>
+    // Enhanced form validation
+    document.querySelectorAll('form').forEach(form => {
+      form.addEventListener('submit', function(e) {
+        const username = this.querySelector('input[name="username"]').value.trim();
+        const password = this.querySelector('input[name="password"]').value;
+        
+        if (!username || !password) {
+          e.preventDefault();
+          showErrorPopup('Please fill in all required fields.');
+          return false;
+        }
+        
+        // Show loading state
+        const submitBtn = this.querySelector('.submit-button');
+        const originalText = submitBtn.innerHTML;
+        submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Verifying...';
+        submitBtn.disabled = true;
+        
+        // Re-enable after 3 seconds if no redirect
+        setTimeout(() => {
+          submitBtn.innerHTML = originalText;
+          submitBtn.disabled = false;
+        }, 3000);
+      });
+    });
   </script>
-
 </body>
 </html>
